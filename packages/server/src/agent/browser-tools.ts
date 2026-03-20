@@ -346,6 +346,6 @@ async function detectDomChanges(
 
   return {
     urlChanged: urlAfter !== urlBefore,
-    domChanged: mutationCount > 10,
+    domChanged: mutationCount > 3,
   }
 }
