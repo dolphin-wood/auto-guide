@@ -93,4 +93,13 @@ injectWebSocket(server)
 
 logger.info({ port: PORT }, 'Auto-Guide server running')
 
+function shutdown() {
+  logger.info('Shutting down...')
+  server.close()
+  process.exit(0)
+}
+
+process.on('SIGINT', shutdown)
+process.on('SIGTERM', shutdown)
+
 export { relay, sidepanel }
