@@ -13,31 +13,36 @@ AI を使って、自然言語の操作説明から Web アプリケーション
 
 ```
                           Hono Server
-                    ┌──────────────────────┐
- Sidepanel (React)  │  Claude Agent SDK    │  Extension Background
-     │              │     query()          │         │
-     │  操作手順     │       │              │         │
-     │ ── WS ─────>│       ▼              │         │
-     │              │  MCP Browser Tools   │         │
-     │  streaming   │       │              │         │
-     │ <── WS ─────│       ▼              │         │
-     │              │   Playwright         │         │
-     │              │       │              │         │
-     │              │       ▼              │         │
-     │              │   CDP Relay ── WS ──────────> │
-     │              └──────────────────────┘         │
-     │                                        chrome.debugger
-     │                                               │
-     │                                               ▼
-     │                                          対象ページ
-     │  show_overlay                                 │
-     │ ──────── tabs.sendMessage ──────────> Content Script
-     │                                        (オーバーレイ)
+                    ┌──────────────────────────┐
+ Sidepanel (React)  │  Orchestrator (per-tab)  │  Extension Background
+     │              │     │                    │         │
+     │  generate    │     ▼                    │         │
+     │ ── WS ─────>│  Claude Agent SDK        │         │
+     │              │     query()              │         │
+     │  streaming   │     │                    │         │
+     │ <── WS ─────│     ▼                    │         │
+     │              │  MCP Browser Tools       │         │
+     │              │     │                    │         │
+     │              │     ▼                    │         │
+     │              │  Playwright              │         │
+     │              │     │                    │         │
+     │              │     ▼                    │         │
+     │              │  CDP Relay ── WS ──────────────> │
+     │              │  /cdp/:tabId             │         │
+     │              └──────────────────────────┘         │
+     │                                            chrome.debugger
+     │                                            (per-tab attach)
+     │                                                   │
+     │                                                   ▼
+     │                                              対象ページ
+     │  show_overlay                                     │
+     │ ──────── tabs.sendMessage ──────────────> Content Script
+     │ <─── overlay_next/previous/stop ────────  (オーバーレイ)
 ```
 
-- **Server**: Hono + Claude Agent SDK + Playwright
-- **CDP Relay**: Extension の `chrome.debugger` API と Playwright 間の WebSocket ブリッジ。Playwright が `connectOverCDP()` で接続し、実際のブラウザタブを操作できるようにする
-- **Extension**: WXT (Chrome MV3) + React + shadcn/ui（サイドパネル UI + オーバーレイ）
+- **Server**: Hono + Claude Agent SDK + Playwright（タブごとに独立したセッション管理）
+- **CDP Relay**: Extension の `chrome.debugger` API と Playwright 間の WebSocket ブリッジ（[playwriter](https://github.com/remorses/playwriter) ベース）。`/cdp/:tabId` エンドポイントでタブごとに独立した Playwright 接続を管理
+- **Extension**: WXT (Chrome MV3) + React + shadcn/ui（タブバインド型サイドパネル + スポットライトオーバーレイ）
 - **Shared**: TypeScript 型定義（Guide, ActionRecord 等）
 
 ## セットアップ
