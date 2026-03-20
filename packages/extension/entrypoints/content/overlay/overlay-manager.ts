@@ -46,7 +46,20 @@ export class OverlayManager {
         element.tagName,
         `${rect.width}x${rect.height} @ (${rect.left},${rect.top})`,
       )
-      this.showForElement(element, command)
+      // Scroll element into view if not visible
+      const elRect = element.getBoundingClientRect()
+      const inView =
+        elRect.top >= 0 &&
+        elRect.bottom <= window.innerHeight &&
+        elRect.left >= 0 &&
+        elRect.right <= window.innerWidth
+      if (!inView) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })
+      }
+
+      // Wait for smooth scroll to finish before showing overlay
+      const delay = inView ? 0 : 400
+      setTimeout(() => this.showForElement(element, command), delay)
     })
   }
 
