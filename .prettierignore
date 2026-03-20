@@ -1,0 +1,7 @@
+node_modules
+dist
+.output
+.wxt
+pnpm-lock.yaml
+tmp
+packages/server/src/agent/scripts/finder-inject.ts
