@@ -20,13 +20,15 @@ export class AgentOrchestrator extends EventEmitter {
   private page: Page | null = null
   private cdpEndpoint: string
   private relay: CDPRelay | undefined
+  private tabId: number
   private toolNameMap = new Map<string, string>()
   private sessionId: string | null = null
 
-  constructor(cdpEndpoint: string, relay?: CDPRelay) {
+  constructor(cdpEndpoint: string, relay?: CDPRelay, tabId = 0) {
     super()
     this.cdpEndpoint = cdpEndpoint
     this.relay = relay
+    this.tabId = tabId
   }
 
   getState(): OrchestratorState {
@@ -75,10 +77,11 @@ export class AgentOrchestrator extends EventEmitter {
     // Connect Playwright through CDP relay if not already connected
     if (!this.page) {
       if (this.relay) {
-        this.relay.setTargetTab({ url: journey })
+        this.relay.setTargetTab(this.tabId, { tabId: this.tabId, url: journey })
       }
-      logger.info({ endpoint: this.cdpEndpoint }, 'Connecting to CDP relay')
-      this.browser = await chromium.connectOverCDP(this.cdpEndpoint)
+      const endpoint = `${this.cdpEndpoint}/${this.tabId}`
+      logger.info({ endpoint, tabId: this.tabId }, 'Connecting to CDP relay')
+      this.browser = await chromium.connectOverCDP(endpoint)
 
       let retries = 0
       while (retries < 10) {

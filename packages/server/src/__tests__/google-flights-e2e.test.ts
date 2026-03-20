@@ -57,13 +57,13 @@ describe.skipIf(!hasApiKey)('Google Flights E2E with LLM-as-judge', () => {
       '/cdp',
       upgradeWebSocket(() => ({
         onOpen(_evt, ws) {
-          relay.handlePlaywrightOpen(ws)
+          relay.handlePlaywrightOpen(ws, 0)
         },
         onMessage(evt) {
-          relay.handlePlaywrightMessage(evt.data as string)
+          relay.handlePlaywrightMessage(evt.data as string, 0)
         },
         onClose() {
-          relay.handlePlaywrightClose()
+          relay.handlePlaywrightClose(0)
         },
       })),
     )
@@ -77,7 +77,7 @@ describe.skipIf(!hasApiKey)('Google Flights E2E with LLM-as-judge', () => {
           sidepanel.onMessage(evt.data, ws)
         },
         onClose() {
-          sidepanel.onClose()
+          sidepanel.onClose(ws)
         },
       })),
     )

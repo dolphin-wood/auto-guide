@@ -15,6 +15,7 @@ const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app })
 
 const relay = new CDPRelay()
 const sidepanel = createSidepanelHandler('ws://localhost:3100/cdp', relay)
+// cdpEndpoint is the base URL — orchestrator appends /:tabId
 
 // Health check
 app.get('/health', (c) => {
@@ -26,7 +27,7 @@ app.get('/json/version', (c) => {
   return c.json({
     Browser: 'Chrome/AutoGuide-Extension',
     'Protocol-Version': '1.3',
-    webSocketDebuggerUrl: `ws://${c.req.header('host') ?? 'localhost:3100'}/cdp`,
+    webSocketDebuggerUrl: `ws://${c.req.header('host') ?? 'localhost:3100'}/cdp/0`,
   })
 })
 
@@ -50,20 +51,23 @@ app.get(
   })),
 )
 
-// CDP WebSocket — Playwright connectOverCDP() connects here
+// CDP WebSocket — Playwright connectOverCDP() connects here, one per tab
 app.get(
-  '/cdp',
-  upgradeWebSocket(() => ({
-    onOpen(_evt, ws) {
-      relay.handlePlaywrightOpen(ws)
-    },
-    onMessage(evt, _ws) {
-      relay.handlePlaywrightMessage(evt.data as string)
-    },
-    onClose() {
-      relay.handlePlaywrightClose()
-    },
-  })),
+  '/cdp/:tabId',
+  upgradeWebSocket((c) => {
+    const tabId = Number(c.req.param('tabId'))
+    return {
+      onOpen(_evt, ws) {
+        relay.handlePlaywrightOpen(ws, tabId)
+      },
+      onMessage(evt, _ws) {
+        relay.handlePlaywrightMessage(evt.data as string, tabId)
+      },
+      onClose() {
+        relay.handlePlaywrightClose(tabId)
+      },
+    }
+  }),
 )
 
 // Sidepanel WebSocket — Extension sidepanel connects here
@@ -76,8 +80,8 @@ app.get(
     onMessage(evt, ws) {
       sidepanel.onMessage(evt.data, ws)
     },
-    onClose() {
-      sidepanel.onClose()
+    onClose(_evt, ws) {
+      sidepanel.onClose(ws)
     },
   })),
 )
@@ -95,7 +99,7 @@ logger.info({ port: PORT }, 'Auto-Guide server running')
 
 function shutdown() {
   logger.info('Shutting down...')
-  server.close()
+  // Force exit — server.close() waits for existing connections which blocks shutdown
   process.exit(0)
 }
 

@@ -10,51 +10,49 @@ export function createSidepanelHandler(
 ): {
   onOpen: (ws: WSContext) => void
   onMessage: (data: WSMessageReceive, ws: WSContext) => void
-  onClose: () => void
+  onClose: (ws: WSContext) => void
   orchestrator: AgentOrchestrator // default orchestrator for tests
 } {
   const sessions = new Map<number, AgentOrchestrator>()
-  let activeWs: WSContext | null = null
+  const tabWs = new Map<number, WSContext>()
+  const wsTab = new Map<WSContext, number>()
 
-  function getOrCreateOrchestrator(tabId?: number): AgentOrchestrator {
-    const key = tabId ?? 0
-    let orchestrator = sessions.get(key)
+  function getOrCreateOrchestrator(tabId: number): AgentOrchestrator {
+    let orchestrator = sessions.get(tabId)
     if (!orchestrator) {
-      orchestrator = new AgentOrchestrator(cdpEndpoint, relay)
-      sessions.set(key, orchestrator)
-      wireOrchestrator(orchestrator)
-      logger.info({ tabId: key }, 'Created new orchestrator session')
+      orchestrator = new AgentOrchestrator(cdpEndpoint, relay, tabId)
+      sessions.set(tabId, orchestrator)
+      wireOrchestrator(tabId, orchestrator)
+      logger.info({ tabId }, 'Created new orchestrator session')
     }
     return orchestrator
   }
 
-  function wireOrchestrator(orchestrator: AgentOrchestrator): void {
-    orchestrator.on('message', (msg: ServerToSidepanelMessage) => {
-      logger.debug({ type: msg.type, hasWs: !!activeWs }, 'Forwarding to sidepanel')
-      if (activeWs) send(activeWs, msg)
-    })
-    orchestrator.on('guide_complete', ({ guide }: { guide: unknown }) => {
-      if (activeWs) {
-        send(activeWs, { type: 'guide_complete', data: { guide } } as ServerToSidepanelMessage)
+  function wireOrchestrator(tabId: number, orchestrator: AgentOrchestrator): void {
+    const sendToTab = (msg: ServerToSidepanelMessage) => {
+      const ws = tabWs.get(tabId)
+      if (ws) {
+        ws.send(JSON.stringify(msg))
+      } else {
+        logger.warn({ tabId, type: msg.type }, 'No sidepanel WS for tab')
       }
+    }
+
+    orchestrator.on('message', sendToTab)
+    orchestrator.on('guide_complete', ({ guide }: { guide: unknown }) => {
+      sendToTab({ type: 'guide_complete', data: { guide } } as ServerToSidepanelMessage)
     })
     orchestrator.on('generation_finished', () => {
-      if (activeWs) {
-        send(activeWs, { type: 'generation_finished', data: {} } as ServerToSidepanelMessage)
-      }
+      sendToTab({ type: 'generation_finished', data: {} } as ServerToSidepanelMessage)
     })
-  }
-
-  function send(ws: WSContext, message: ServerToSidepanelMessage): void {
-    ws.send(JSON.stringify(message))
   }
 
   function onOpen(ws: WSContext): void {
-    activeWs = ws
     logger.info('Sidepanel connected')
+    // Tab binding happens on first message with tabId
   }
 
-  function onMessage(data: WSMessageReceive, _ws: WSContext): void {
+  function onMessage(data: WSMessageReceive, ws: WSContext): void {
     let msg: SidepanelToServerMessage
     try {
       msg = JSON.parse(
@@ -64,21 +62,31 @@ export function createSidepanelHandler(
       return
     }
 
+    if (!msg.data) return
+    const tabId = msg.data.tabId ?? 0
+
+    // Bind this WS to the tab
+    if (!wsTab.has(ws)) {
+      wsTab.set(ws, tabId)
+      tabWs.set(tabId, ws)
+      logger.info({ tabId }, 'Sidepanel bound to tab')
+    }
+
     switch (msg.type) {
       case 'generate': {
-        const orchestrator = getOrCreateOrchestrator(msg.data.tabId)
+        const orchestrator = getOrCreateOrchestrator(tabId)
         orchestrator.startGeneration(msg.data.journeyDescription, msg.data.startUrl ?? '')
         break
       }
       case 'stop': {
-        const orchestrator = sessions.get(msg.data.tabId ?? 0)
+        const orchestrator = sessions.get(tabId)
         orchestrator?.stop()
         break
       }
       case 'user_follow_up': {
-        const orchestrator = sessions.get(msg.data.tabId ?? 0)
+        const orchestrator = sessions.get(tabId)
         if (orchestrator) {
-          logger.info({ tabId: msg.data.tabId, text: msg.data.text }, 'Follow-up')
+          logger.info({ tabId, text: msg.data.text }, 'Follow-up')
           // TODO: inject follow-up into running agent session
         }
         break
@@ -86,9 +94,15 @@ export function createSidepanelHandler(
     }
   }
 
-  function onClose(): void {
-    activeWs = null
-    logger.info('Sidepanel disconnected')
+  function onClose(ws: WSContext): void {
+    const tabId = wsTab.get(ws)
+    if (tabId !== undefined) {
+      tabWs.delete(tabId)
+      wsTab.delete(ws)
+      logger.info({ tabId }, 'Sidepanel disconnected')
+    } else {
+      logger.info('Sidepanel disconnected (unbound)')
+    }
   }
 
   // Expose default orchestrator for backward compat (tests)

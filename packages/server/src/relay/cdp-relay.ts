@@ -15,10 +15,18 @@ interface ConnectedTarget {
   }
 }
 
+interface RelayChannel {
+  tabId: number
+  playwrightWs: WSContext | null
+  connectedTargets: Map<string, ConnectedTarget>
+  targetsSentToPlaywright: Set<string>
+  pendingAttachParams: Record<string, unknown> | null
+}
+
 export class CDPRelay {
-  private connectedTargets = new Map<string, ConnectedTarget>()
+  private channels = new Map<number, RelayChannel>()
+  private sessionToTab = new Map<string, number>()
   private extensionWs: WSContext | null = null
-  private playwrightWs: WSContext | null = null
   private extensionPendingRequests = new Map<
     number,
     {
@@ -28,8 +36,21 @@ export class CDPRelay {
   >()
   private extensionMessageId = 0
   private emitter = new EventEmitter()
-  private targetsSentToPlaywright = new Set<string>()
-  private pendingAttachParams: Record<string, unknown> | null = null
+
+  private getOrCreateChannel(tabId: number): RelayChannel {
+    let channel = this.channels.get(tabId)
+    if (!channel) {
+      channel = {
+        tabId,
+        playwrightWs: null,
+        connectedTargets: new Map(),
+        targetsSentToPlaywright: new Set(),
+        pendingAttachParams: null,
+      }
+      this.channels.set(tabId, channel)
+    }
+    return channel
+  }
 
   handleExtensionOpen(ws: WSContext): void {
     this.extensionWs = ws
@@ -81,27 +102,42 @@ export class CDPRelay {
 
         if (tp.targetInfo.type !== 'page') return
 
-        const alreadyConnected = this.connectedTargets.has(tp.sessionId)
-        this.connectedTargets.set(tp.sessionId, {
-          sessionId: tp.sessionId,
-          targetId: tp.targetInfo.targetId,
-          targetInfo: { ...tp.targetInfo, attached: true },
-        })
-
-        if (!alreadyConnected) {
-          this.targetsSentToPlaywright.add(tp.sessionId)
-          this.sendToPlaywright({
-            method: 'Target.attachedToTarget',
-            params: tp,
-          })
+        // Find which channel this session belongs to
+        const tabId = this.sessionToTab.get(params.sessionId) ?? this.sessionToTab.get(tp.sessionId)
+        if (tabId === undefined) {
+          // New target — assign to the channel that has a pending attach
+          for (const ch of this.channels.values()) {
+            if (ch.pendingAttachParams && !ch.connectedTargets.has(tp.sessionId)) {
+              this.assignTargetToChannel(ch, tp)
+              return
+            }
+          }
+          // Fallback: assign to first channel without targets
+          for (const ch of this.channels.values()) {
+            if (ch.connectedTargets.size === 0) {
+              this.assignTargetToChannel(ch, tp)
+              return
+            }
+          }
+          return
         }
+
+        const channel = this.channels.get(tabId)
+        if (!channel) return
+
+        this.assignTargetToChannel(channel, tp)
         return
       }
 
       if (params.method === 'Target.detachedFromTarget') {
         const dp = params.params as { sessionId: string }
-        this.connectedTargets.delete(dp.sessionId)
-        this.sendToPlaywright({ method: 'Target.detachedFromTarget', params: dp })
+        const tabId = this.sessionToTab.get(dp.sessionId)
+        if (tabId !== undefined) {
+          const channel = this.channels.get(tabId)
+          channel?.connectedTargets.delete(dp.sessionId)
+          this.sessionToTab.delete(dp.sessionId)
+          this.sendToPlaywright(tabId, { method: 'Target.detachedFromTarget', params: dp })
+        }
         return
       }
 
@@ -109,24 +145,64 @@ export class CDPRelay {
         const tp = params.params as {
           targetInfo: { targetId: string; url: string; title: string }
         }
-        for (const [, target] of this.connectedTargets) {
-          if (target.targetId === tp.targetInfo.targetId) {
-            target.targetInfo.url = tp.targetInfo.url
-            target.targetInfo.title = tp.targetInfo.title
+        for (const channel of this.channels.values()) {
+          for (const target of channel.connectedTargets.values()) {
+            if (target.targetId === tp.targetInfo.targetId) {
+              target.targetInfo.url = tp.targetInfo.url
+              target.targetInfo.title = tp.targetInfo.title
+            }
           }
         }
       }
 
+      // Route event to the correct channel by sessionId
+      const tabId = this.sessionToTab.get(params.sessionId)
       const cdpEvent = { method: params.method, params: params.params, sessionId: params.sessionId }
       this.emitter.emit('cdp:event', { event: cdpEvent })
-      this.sendToPlaywright(cdpEvent)
+      if (tabId !== undefined) {
+        this.sendToPlaywright(tabId, cdpEvent)
+      }
+    }
+  }
+
+  private assignTargetToChannel(
+    channel: RelayChannel,
+    tp: {
+      sessionId: string
+      targetInfo: {
+        targetId: string
+        type: string
+        title: string
+        url: string
+        browserContextId?: string
+      }
+      waitingForDebugger: boolean
+    },
+  ): void {
+    const alreadyConnected = channel.connectedTargets.has(tp.sessionId)
+    channel.connectedTargets.set(tp.sessionId, {
+      sessionId: tp.sessionId,
+      targetId: tp.targetInfo.targetId,
+      targetInfo: { ...tp.targetInfo, attached: true },
+    })
+    this.sessionToTab.set(tp.sessionId, channel.tabId)
+
+    if (!alreadyConnected) {
+      channel.targetsSentToPlaywright.add(tp.sessionId)
+      this.sendToPlaywright(channel.tabId, {
+        method: 'Target.attachedToTarget',
+        params: tp,
+      })
     }
   }
 
   handleExtensionClose(): void {
     this.extensionWs = null
-    this.connectedTargets.clear()
-    this.targetsSentToPlaywright.clear()
+    for (const channel of this.channels.values()) {
+      channel.connectedTargets.clear()
+      channel.targetsSentToPlaywright.clear()
+    }
+    this.sessionToTab.clear()
     for (const pending of this.extensionPendingRequests.values()) {
       pending.reject(new Error('Extension disconnected'))
     }
@@ -134,12 +210,13 @@ export class CDPRelay {
     logger.info('Extension disconnected')
   }
 
-  handlePlaywrightOpen(ws: WSContext): void {
-    this.playwrightWs = ws
-    logger.info('Playwright connected')
+  handlePlaywrightOpen(ws: WSContext, tabId: number): void {
+    const channel = this.getOrCreateChannel(tabId)
+    channel.playwrightWs = ws
+    logger.info({ tabId }, 'Playwright connected')
   }
 
-  async handlePlaywrightMessage(data: string): Promise<void> {
+  async handlePlaywrightMessage(data: string, tabId: number): Promise<void> {
     let message: Record<string, unknown>
     try {
       message = JSON.parse(data) as Record<string, unknown>
@@ -147,24 +224,27 @@ export class CDPRelay {
       return
     }
 
+    const channel = this.channels.get(tabId)
+    if (!channel) return
+
     const id = message.id as number
     const method = message.method as string
     const params = message.params as Record<string, unknown> | undefined
     const sessionId = message.sessionId as string | undefined
 
     if (!this.extensionWs) {
-      this.sendToPlaywright({ id, sessionId, error: { message: 'Extension not connected' } })
+      this.sendToPlaywright(tabId, { id, sessionId, error: { message: 'Extension not connected' } })
       return
     }
 
     try {
-      const result = await this.routeCdpCommand(method, params, sessionId)
+      const result = await this.routeCdpCommand(channel, method, params, sessionId)
 
       if (method === 'Target.setAutoAttach' && !sessionId) {
-        for (const target of this.connectedTargets.values()) {
-          if (this.targetsSentToPlaywright.has(target.sessionId)) continue
-          this.targetsSentToPlaywright.add(target.sessionId)
-          this.sendToPlaywright({
+        for (const target of channel.connectedTargets.values()) {
+          if (channel.targetsSentToPlaywright.has(target.sessionId)) continue
+          channel.targetsSentToPlaywright.add(target.sessionId)
+          this.sendToPlaywright(tabId, {
             method: 'Target.attachedToTarget',
             params: {
               sessionId: target.sessionId,
@@ -176,8 +256,8 @@ export class CDPRelay {
       }
 
       if (method === 'Target.setDiscoverTargets') {
-        for (const target of this.connectedTargets.values()) {
-          this.sendToPlaywright({
+        for (const target of channel.connectedTargets.values()) {
+          this.sendToPlaywright(tabId, {
             method: 'Target.targetCreated',
             params: { targetInfo: { ...target.targetInfo, attached: true } },
           })
@@ -186,9 +266,9 @@ export class CDPRelay {
 
       if (method === 'Target.attachToTarget' && (result as Record<string, unknown>)?.sessionId) {
         const targetId = params?.targetId as string
-        for (const target of this.connectedTargets.values()) {
+        for (const target of channel.connectedTargets.values()) {
           if (target.targetId === targetId) {
-            this.sendToPlaywright({
+            this.sendToPlaywright(tabId, {
               method: 'Target.attachedToTarget',
               params: {
                 sessionId: (result as Record<string, unknown>).sessionId,
@@ -200,9 +280,9 @@ export class CDPRelay {
         }
       }
 
-      this.sendToPlaywright({ id, sessionId, result })
+      this.sendToPlaywright(tabId, { id, sessionId, result })
     } catch (err) {
-      this.sendToPlaywright({
+      this.sendToPlaywright(tabId, {
         id,
         sessionId,
         error: { message: err instanceof Error ? err.message : String(err) },
@@ -210,20 +290,31 @@ export class CDPRelay {
     }
   }
 
-  handlePlaywrightClose(): void {
-    this.playwrightWs = null
-    logger.info('Playwright disconnected')
+  handlePlaywrightClose(tabId: number): void {
+    const channel = this.channels.get(tabId)
+    if (channel) {
+      channel.playwrightWs = null
+      // Clean up session mappings
+      for (const sessionId of channel.connectedTargets.keys()) {
+        this.sessionToTab.delete(sessionId)
+      }
+      channel.connectedTargets.clear()
+      channel.targetsSentToPlaywright.clear()
+    }
+    logger.info({ tabId }, 'Playwright disconnected')
   }
 
   isExtensionConnected(): boolean {
     return this.extensionWs !== null
   }
 
-  setTargetTab(params: { tabId?: number; url?: string }): void {
-    this.pendingAttachParams = params
+  setTargetTab(tabId: number, params: { tabId?: number; url?: string }): void {
+    const channel = this.getOrCreateChannel(tabId)
+    channel.pendingAttachParams = { ...params, tabId }
   }
 
   private async routeCdpCommand(
+    channel: RelayChannel,
     method: string,
     params: Record<string, unknown> | undefined,
     sessionId: string | undefined,
@@ -243,10 +334,13 @@ export class CDPRelay {
 
       case 'Target.setAutoAttach': {
         if (sessionId) break
-        if (this.connectedTargets.size === 0) {
+        if (channel.connectedTargets.size === 0) {
           try {
-            const createParams = this.pendingAttachParams ?? { url: 'about:blank' }
-            this.pendingAttachParams = null
+            const createParams = channel.pendingAttachParams ?? {
+              url: 'about:blank',
+              tabId: channel.tabId,
+            }
+            channel.pendingAttachParams = null
 
             const tabResult = (await this.sendToExtension('createInitialTab', createParams)) as {
               sessionId: string
@@ -259,14 +353,15 @@ export class CDPRelay {
               }
             }
             if (tabResult?.sessionId && tabResult?.targetInfo) {
-              this.connectedTargets.set(tabResult.sessionId, {
+              channel.connectedTargets.set(tabResult.sessionId, {
                 sessionId: tabResult.sessionId,
                 targetId: tabResult.targetInfo.targetId,
                 targetInfo: { ...tabResult.targetInfo, attached: true },
               })
+              this.sessionToTab.set(tabResult.sessionId, channel.tabId)
             }
           } catch (err) {
-            logger.error({ err }, 'Failed to create initial tab')
+            logger.error({ err, tabId: channel.tabId }, 'Failed to create initial tab')
           }
         }
         return {}
@@ -277,7 +372,7 @@ export class CDPRelay {
 
       case 'Target.attachToTarget': {
         const targetId = params?.targetId as string
-        for (const target of this.connectedTargets.values()) {
+        for (const target of channel.connectedTargets.values()) {
           if (target.targetId === targetId) {
             return { sessionId: target.sessionId }
           }
@@ -288,23 +383,23 @@ export class CDPRelay {
       case 'Target.getTargetInfo': {
         const targetId = params?.targetId as string | undefined
         if (targetId) {
-          for (const target of this.connectedTargets.values()) {
+          for (const target of channel.connectedTargets.values()) {
             if (target.targetId === targetId) {
               return { targetInfo: target.targetInfo }
             }
           }
         }
         if (sessionId) {
-          const target = this.connectedTargets.get(sessionId)
+          const target = channel.connectedTargets.get(sessionId)
           if (target) return { targetInfo: target.targetInfo }
         }
-        const first = this.connectedTargets.values().next().value
+        const first = channel.connectedTargets.values().next().value
         return { targetInfo: first?.targetInfo }
       }
 
       case 'Target.getTargets':
         return {
-          targetInfos: [...this.connectedTargets.values()].map((t) => ({
+          targetInfos: [...channel.connectedTargets.values()].map((t) => ({
             ...t.targetInfo,
             attached: true,
           })),
@@ -354,7 +449,7 @@ export class CDPRelay {
       }
     }
 
-    const resolvedSessionId = sessionId ?? this.connectedTargets.values().next().value?.sessionId
+    const resolvedSessionId = sessionId ?? channel.connectedTargets.values().next().value?.sessionId
     if (!resolvedSessionId) throw new Error('No active session for CDP command')
 
     return await this.sendToExtension('forwardCDPCommand', {
@@ -392,9 +487,10 @@ export class CDPRelay {
     })
   }
 
-  private sendToPlaywright(msg: Record<string, unknown>): void {
-    if (this.playwrightWs) {
-      this.playwrightWs.send(JSON.stringify(msg))
+  private sendToPlaywright(tabId: number, msg: Record<string, unknown>): void {
+    const channel = this.channels.get(tabId)
+    if (channel?.playwrightWs) {
+      channel.playwrightWs.send(JSON.stringify(msg))
     }
   }
 }

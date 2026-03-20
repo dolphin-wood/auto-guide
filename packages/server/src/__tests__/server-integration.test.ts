@@ -27,7 +27,7 @@ describe('Server WebSocket integration', () => {
           sidepanel.onMessage(evt.data, ws)
         },
         onClose() {
-          sidepanel.onClose()
+          sidepanel.onClose(ws)
         },
       })),
     )
